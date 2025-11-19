@@ -86,16 +86,38 @@ class Predictor(predictor_base.Predictor):
     self._gradient_checkpointing = gradient_checkpointing
 
   def _get_and_validate_constant_inputs(self, inputs, targets, forcings):
-    constant_inputs = inputs.drop_vars(targets.keys(), errors='ignore')
-    constant_inputs = constant_inputs.drop_vars(
-        forcings.keys(), errors='ignore')
+    """Extract and validate time-independent inputs.
+
+    Any variable in `inputs` that is not in `targets` or `forcings` and has
+    no 'time' dimension is treated as a constant input (static feature).
+
+    If `inputs` is None, we raise a clear error rather than failing with
+    an AttributeError deeper in the code.
+    """
+    if inputs is None:
+      raise ValueError(
+          "autoregressive.Predictor received inputs=None in "
+          "_get_and_validate_constant_inputs. This usually means the "
+          "caller passed inputs=None into the model. Make sure you call "
+          "the predictor with a proper xarray.Dataset for `inputs`."
+      )
+
+    # Strip out any variables that are already part of targets or forcings;
+    # what remains (if any) are candidate constant inputs.
+    constant_inputs = inputs.drop_vars(targets.keys(), errors="ignore")
+    constant_inputs = constant_inputs.drop_vars(forcings.keys(), errors="ignore")
+
+    # All remaining variables here must *not* be time-dependent.
     for name, var in constant_inputs.items():
-      if 'time' in var.dims:
+      if "time" in var.dims:
         raise ValueError(
-            f'Time-dependent input variable {name} must either be a forcing '
-            'variable, or a target variable to allow for auto-regressive '
-            'feedback.')
+            f"Time-dependent input variable {name} must either be a forcing "
+            "variable, or a target variable to allow for auto-regressive "
+            "feedback."
+        )
+
     return constant_inputs
+
 
   def _validate_targets_and_forcings(self, targets, forcings):
     for name, var in targets.items():
@@ -124,7 +146,7 @@ class Predictor(predictor_base.Predictor):
             # next AR iteration.
             .assign_coords(time=inputs.coords['time']))
 
-  def __call__(self,
+     def __call__(self,
                inputs: xarray.Dataset,
                targets_template: xarray.Dataset,
                forcings: xarray.Dataset,
@@ -139,31 +161,23 @@ class Predictor(predictor_base.Predictor):
       targets_template: A target template containing informations about which
         variables should be predicted and the time alignment of the predictions.
         All target variables must be time-dependent.
-        The number of time frames is used to set the number of unroll of the AR
-        predictor (e.g. multiple unroll of the inner predictor for one time step
-        in the targets is not supported yet).
       forcings: Variables that will be fed to the model. The variables
-        should not overlap with the target ones. The time coordinates of the
-        forcing variables should match the target ones.
-        Forcing variables which are also present in the inputs, will be used to
-        supply ground-truth values for those inputs when they are passed to the
-        underlying predictor at timesteps beyond the first timestep.
+        should not overlap with the target ones.
       **kwargs: Additional arguments passed along to the inner Predictor.
 
     Returns:
       predictions: the model predictions matching the target template.
-
-    Raise:
-      ValueError: if the time coordinates of the inputs and targets are not
-        different by a constant time step.
     """
 
+    # Separate static (time-independent) inputs from dynamic inputs/targets.
     constant_inputs = self._get_and_validate_constant_inputs(
         inputs, targets_template, forcings)
     self._validate_targets_and_forcings(targets_template, forcings)
 
     # After the above checks, the remaining inputs must be time-dependent:
-    inputs = inputs.drop_vars(constant_inputs.keys())
+    # If there are no constant inputs, this is a no-op.
+    if len(constant_inputs.data_vars) > 0:
+      inputs = inputs.drop_vars(constant_inputs.keys())
 
     # A predictions template only including the next time to predict.
     target_template = targets_template.isel(time=[0])
@@ -171,6 +185,65 @@ class Predictor(predictor_base.Predictor):
     flat_forcings, forcings_treedef = (
         _get_flat_arrays_and_single_timestep_treedef(forcings))
     scan_variables = flat_forcings
+
+    def one_step_prediction(inputs, scan_variables):
+
+      flat_forcings = scan_variables
+      forcings = _unflatten_and_expand_time(
+          flat_forcings, forcings_treedef, target_template.coords["time"]
+      )
+
+      # Add constant inputs:
+      if len(constant_inputs.data_vars) > 0:
+        all_inputs = xarray.merge([constant_inputs, inputs])
+      else:
+        all_inputs = inputs
+
+      predictions: xarray.Dataset = self._predictor(
+          all_inputs,
+          target_template,
+          forcings=forcings,
+          **kwargs,
+      )
+
+      next_frame = xarray.merge([predictions, forcings])
+      next_inputs = self._update_inputs(inputs, next_frame)
+
+      # Drop the length-1 time dimension, since scan will concat all the outputs
+      # for different times along a new leading time dimension:
+      predictions = predictions.squeeze("time", drop=True)
+      # We return the prediction flattened into plain jax arrays, because the
+      # extra leading dimension added by scan prevents the tree_util
+      # registrations in xarray_jax from unflattening them back into an
+      # xarray.Dataset automatically:
+      flat_pred = jax.tree_util.tree_leaves(predictions)
+      return next_inputs, flat_pred
+
+    if self._gradient_checkpointing:
+      scan_length = targets_template.dims["time"]
+      if scan_length <= 1:
+        logging.warning(
+            "Skipping gradient checkpointing for sequence length of 1"
+        )
+      else:
+        # Just in case we take gradients (e.g. for control), although
+        # in most cases this will just be for a forward pass.
+        one_step_prediction = hk.remat(one_step_prediction)
+
+    # Loop (without unroll) with hk states in cell (jax.lax.scan won't do).
+    _, flat_preds = hk.scan(one_step_prediction, inputs, scan_variables)
+
+    # The result of scan will have an extra leading axis on all arrays,
+    # corresponding to the target times in this case. We need to be prepared for
+    # it when unflattening the arrays back into a Dataset:
+    scan_result_template = (
+        target_template.squeeze("time", drop=True)
+        .expand_dims(time=targets_template.coords["time"], axis=0)
+    )
+    _, scan_result_treedef = jax.tree_util.tree_flatten(scan_result_template)
+    predictions = jax.tree_util.tree_unflatten(scan_result_treedef, flat_preds)
+    return predictions
+
 
     def one_step_prediction(inputs, scan_variables):
 
@@ -228,7 +301,7 @@ class Predictor(predictor_base.Predictor):
            **kwargs
            ) -> predictor_base.LossAndDiagnostics:
     """The mean of the per-timestep losses of the underlying predictor."""
-    if targets.sizes['time'] == 1:
+    if targets.sizes["time"] == 1:
       # If there is only a single target timestep then we don't need any
       # autoregressive feedback and can delegate the loss directly to the
       # underlying single-step predictor. This means the underlying predictor
@@ -238,8 +311,10 @@ class Predictor(predictor_base.Predictor):
     constant_inputs = self._get_and_validate_constant_inputs(
         inputs, targets, forcings)
     self._validate_targets_and_forcings(targets, forcings)
+
     # After the above checks, the remaining inputs must be time-dependent:
-    inputs = inputs.drop_vars(constant_inputs.keys())
+    if len(constant_inputs.data_vars) > 0:
+      inputs = inputs.drop_vars(constant_inputs.keys())
 
     if self._noise_level:
       def add_noise(x):
@@ -258,6 +333,72 @@ class Predictor(predictor_base.Predictor):
     flat_forcings, forcings_treedef = (
         _get_flat_arrays_and_single_timestep_treedef(forcings))
     scan_variables = (flat_targets, flat_forcings)
+
+  def one_step_loss(inputs, scan_variables):
+      flat_target, flat_forcings = scan_variables
+      forcings = _unflatten_and_expand_time(
+          flat_forcings,
+          forcings_treedef,
+          targets.coords["time"][:1],
+      )
+
+      target = _unflatten_and_expand_time(
+          flat_target,
+          target_treedef,
+          targets.coords["time"][:1],
+      )
+
+      # Add constant inputs:
+      if len(constant_inputs.data_vars) > 0:
+        all_inputs = xarray.merge([constant_inputs, inputs])
+      else:
+        all_inputs = inputs
+
+      (loss, diagnostics), predictions = self._predictor.loss_and_predictions(
+          all_inputs,
+          target,
+          forcings=forcings,
+          **kwargs,
+      )
+
+      # Unwrap to jax arrays shape (batch,):
+      loss, diagnostics = xarray_tree.map_structure(
+          xarray_jax.unwrap_data, (loss, diagnostics))
+
+      predictions = cast(xarray.Dataset, predictions)  # Keeps pytype happy.
+      next_frame = xarray.merge([predictions, forcings])
+      next_inputs = self._update_inputs(inputs, next_frame)
+
+      return next_inputs, (loss, diagnostics)
+
+    if self._gradient_checkpointing:
+      scan_length = targets.dims["time"]
+      if scan_length <= 1:
+        logging.warning(
+            "Skipping gradient checkpointing for sequence length of 1"
+        )
+      else:
+        one_step_loss = hk.remat(one_step_loss)
+
+    # We can pass inputs (the initial state of the loop) in directly as a
+    # Dataset because the shape we pass in to scan is the same as the shape scan
+    # passes to the inner function. But, for scan_variables, we must flatten the
+    # targets (and unflatten them inside the inner function) because they are
+    # passed to the inner function per-timestep without the original time axis.
+    # The same apply to the optional forcing.
+    _, (per_timestep_losses, per_timestep_diagnostics) = hk.scan(
+        one_step_loss, inputs, scan_variables)
+
+    # Re-wrap loss and diagnostics as DataArray and average them over time:
+    (loss, diagnostics) = jax.tree_util.tree_map(
+        lambda x: xarray_jax.DataArray(x, dims=("time", "batch")).mean(
+            "time", skipna=False
+        ),
+        (per_timestep_losses, per_timestep_diagnostics),
+    )
+
+    return loss, diagnostics
+
 
     def one_step_loss(inputs, scan_variables):
       flat_target, flat_forcings = scan_variables
