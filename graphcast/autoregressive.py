@@ -90,18 +90,7 @@ class Predictor(predictor_base.Predictor):
 
     Any variable in `inputs` that is not in `targets` or `forcings` and has
     no 'time' dimension is treated as a constant input (static feature).
-
-    If `inputs` is None, we raise a clear error rather than failing with
-    an AttributeError deeper in the code.
     """
-    if inputs is None:
-      raise ValueError(
-          "autoregressive.Predictor received inputs=None in "
-          "_get_and_validate_constant_inputs. This usually means the "
-          "caller passed inputs=None into the model. Make sure you call "
-          "the predictor with a proper xarray.Dataset for `inputs`."
-      )
-
     # Strip out any variables that are already part of targets or forcings;
     # what remains (if any) are candidate constant inputs.
     constant_inputs = inputs.drop_vars(targets.keys(), errors="ignore")
@@ -117,6 +106,7 @@ class Predictor(predictor_base.Predictor):
         )
 
     return constant_inputs
+
 
   def _validate_targets_and_forcings(self, targets, forcings):
     for name, var in targets.items():
