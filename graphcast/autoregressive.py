@@ -146,7 +146,7 @@ class Predictor(predictor_base.Predictor):
             # next AR iteration.
             .assign_coords(time=inputs.coords['time']))
 
-     def __call__(self,
+  def __call__(self,
                inputs: xarray.Dataset,
                targets_template: xarray.Dataset,
                forcings: xarray.Dataset,
