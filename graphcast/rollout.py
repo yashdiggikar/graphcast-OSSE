@@ -225,8 +225,9 @@ def chunked_prediction(
         at each call of `predictor_fn`. It must evenly divide the number of
         steps in `targets_template`.
     verbose: Whether to log the current chunk being predicted.
-    **chunked_prediction_kwargs: Extra arguments forwarded to
-        `chunked_prediction_generator` (e.g., truth_ds, inject_from_step, ...).
+    **chunked_prediction_kwargs:
+      Extra arguments forwarded to `chunked_prediction_generator`
+      (e.g., truth_ds, truth_t_path, temp_var_name, inject_from_step).
 
   Returns:
     Predictions for the targets template.
@@ -242,9 +243,9 @@ def chunked_prediction(
       num_steps_per_chunk=num_steps_per_chunk,
       verbose=verbose,
       **chunked_prediction_kwargs):
-    # Bring data off device for concatenation.
     chunks_list.append(jax.device_get(prediction_chunk))
   return xarray.concat(chunks_list, dim="time")
+
 
 
 
