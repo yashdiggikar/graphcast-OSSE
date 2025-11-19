@@ -210,6 +210,7 @@ def chunked_prediction(
     forcings: xarray.Dataset,
     num_steps_per_chunk: int = 1,
     verbose: bool = False,
+    **chunked_prediction_kwargs,
 ) -> xarray.Dataset:
   """Outputs a long trajectory by iteratively concatenating chunked predictions.
 
@@ -224,6 +225,8 @@ def chunked_prediction(
         at each call of `predictor_fn`. It must evenly divide the number of
         steps in `targets_template`.
     verbose: Whether to log the current chunk being predicted.
+    **chunked_prediction_kwargs: Extra arguments forwarded to
+        `chunked_prediction_generator` (e.g., truth_ds, inject_from_step, ...).
 
   Returns:
     Predictions for the targets template.
@@ -237,9 +240,12 @@ def chunked_prediction(
       targets_template=targets_template,
       forcings=forcings,
       num_steps_per_chunk=num_steps_per_chunk,
-      verbose=verbose):
+      verbose=verbose,
+      **chunked_prediction_kwargs):
+    # Bring data off device for concatenation.
     chunks_list.append(jax.device_get(prediction_chunk))
   return xarray.concat(chunks_list, dim="time")
+
 
 
 def chunked_prediction_generator(
@@ -250,7 +256,12 @@ def chunked_prediction_generator(
     forcings: xarray.Dataset,
     num_steps_per_chunk: int = 1,
     verbose: bool = False,
-    pmap_devices: Optional[Sequence[jax.Device]] = None
+    pmap_devices: Optional[Sequence[jax.Device]] = None,
+    # ---- NEW KWARGS FOR TEMP INSERTION ----
+    truth_ds: Optional[xarray.Dataset] = None,        # ERA5 truth (preferred: already opened, same grid/times)
+    truth_t_path: Optional[str] = None,               # Alternatively, path to ERA5 file if truth_ds not given
+    temp_var_name: str = "t",                         # Temperature variable name in truth_ds & predictions
+    inject_from_step: Optional[int] = None,           # Global step index (0-based) from which to start replacing
 ) -> Iterator[xarray.Dataset]:
   """Outputs a long trajectory by yielding chunked predictions.
 
@@ -267,9 +278,14 @@ def chunked_prediction_generator(
     verbose: Whether to log the current chunk being predicted.
     pmap_devices: List of devices over which predictor_fn is pmapped, or None if
       it is not pmapped.
+    truth_ds: ERA5 truth `xarray.Dataset` on the same grid/time (contains `temp_var_name`).
+    truth_t_path: Path to ERA5 file to open (used only if `truth_ds` is None).
+    temp_var_name: Name of the temperature variable to replace (default "t").
+    inject_from_step: Global step (0-based) at which to start replacing temp.
+      If None, no replacement occurs.
 
   Yields:
-    The predictions for each chunked step of the chunked rollout, such as
+    The predictions for each chunked step of the chunked rollout, such that
     if all predictions are concatenated in time this would match the targets
     template in structure.
 
@@ -308,6 +324,122 @@ def chunked_prediction_generator(
       time=slice(0, num_steps_per_chunk))
 
   current_inputs = inputs
+
+  # -------------------- open/validate truth source (for insertion) --------------------
+  if truth_ds is None and truth_t_path is not None:
+    # Lazy open; assumes same grid/levels/times as targets_template
+    truth_ds = xarray.open_dataset(truth_t_path)
+
+  if truth_ds is not None:
+    if temp_var_name not in truth_ds.data_vars:
+      raise KeyError(
+          f"temp_var_name='{temp_var_name}' not found in truth_ds. "
+          f"Available: {list(truth_ds.data_vars)}"
+      )
+    if "time" not in truth_ds.coords:
+      raise ValueError("truth_ds must have a 'time' coordinate aligned to targets_template.time")
+
+  # To compute global (0..num_target_steps-1) step index during rollout
+  global_step_offset = 0
+
+  def split_rng_fn(rng):
+    # Note, this is *not* equivalent to `return jax.random.split(rng)`, because
+    # by assigning to a tuple, the single numpy array returned by
+    # `jax.random.split` actually gets split into two arrays, so when calling
+    # the function with pmap the output is Tuple[Array, Array], where the
+    # leading axis of each array is `num devices`.
+    rng1, rng2 = jax.random.split(rng)
+    return rng1, rng2
+
+  if pmap_devices is not None:
+    split_rng_fn = jax.pmap(split_rng_fn, devices=pmap_devices)
+
+  for chunk_index in range(num_chunks):
+    if verbose:
+      logging.info("Chunk %d/%d", chunk_index, num_chunks)
+      logging.flush()
+
+    # Select targets for the time period that we are predicting for this chunk.
+    target_offset = num_steps_per_chunk * chunk_index
+    target_slice = slice(target_offset, target_offset + num_steps_per_chunk)
+    current_targets_template = targets_template.isel(time=target_slice)
+
+    # Save the actual target times (real coordinates for this chunk).
+    actual_target_time = current_targets_template.coords["time"]
+
+    # Replace the timedelta, by the one corresponding to the first chunk, so we
+    # don't recompile at every iteration, keeping the
+    current_targets_template = current_targets_template.assign_coords(
+        time=targets_chunk_time).compute()
+
+    current_forcings = forcings.isel(time=target_slice)
+    current_forcings = current_forcings.assign_coords(time=targets_chunk_time)
+    current_forcings = current_forcings.compute()
+
+    # Make predictions for the chunk.
+    rng, this_rng = split_rng_fn(rng)
+    predictions = predictor_fn(
+        rng=this_rng,
+        inputs=current_inputs,
+        targets_template=current_targets_template,
+        forcings=current_forcings)
+
+    # In the pmapped case, pull data off devices to avoid OOM, and so we can
+    # modify predictions on host (for temp insertion).
+    if pmap_devices is not None:
+      predictions = jax.device_get(predictions)
+      current_forcings = jax.device_get(current_forcings)
+      current_inputs = jax.device_get(current_inputs)
+
+    # -------------------- TEMP INSERTION (ERA5 truth) --------------------
+    # Replace predictions[temp_var_name] for each step in this chunk whose
+    # global step index >= inject_from_step. This is done BEFORE computing
+    # next_frame/current_inputs, so the AR state uses the corrected temperature.
+    if (
+        truth_ds is not None
+        and inject_from_step is not None
+        and temp_var_name in predictions.data_vars
+    ):
+      # actual_target_time still holds the true time coords for this chunk.
+      step_times = actual_target_time.data  # shape: (num_steps_per_chunk,)
+
+      for i, ts in enumerate(step_times):
+        global_step = global_step_offset + i  # 0-based across whole rollout
+
+        if global_step >= inject_from_step:
+          # ERA5 truth at this timestamp; dims typically (time, level, lat, lon)
+          # or possibly with a batch/sample dim that xarray can broadcast.
+          true_t = truth_ds[temp_var_name].sel(time=ts)
+
+          # predictions[temp_var_name] has a "time" axis for this chunk.
+          # We overwrite only this step (all levels/grid points), leaving
+          # other variables unchanged.
+          predictions[temp_var_name][dict(time=i)] = true_t
+
+    # -------------------- end TEMP INSERTION --------------------
+
+    if chunk_index == num_chunks - 1:
+      # No need to call `_get_next_inputs` on the last iteration.
+      current_inputs = None
+    else:
+      next_frame = xarray.merge([predictions, current_forcings])
+      next_inputs = _get_next_inputs(current_inputs, next_frame)
+      # Shift timedelta coordinates, so we don't recompile at every iteration.
+      next_inputs = next_inputs.assign_coords(
+          time=current_inputs.coords["time"])
+      current_inputs = next_inputs
+
+    # Advance global step counter by this chunk length.
+    global_step_offset += num_steps_per_chunk
+
+    # At this point we can assign the actual targets time coordinates.
+    predictions = predictions.assign_coords(time=actual_target_time)
+    if output_datetime is not None:
+      predictions.coords["datetime"] = output_datetime.isel(
+          time=target_slice)
+    yield predictions
+    del predictions
+
 
   def split_rng_fn(rng):
     # Note, this is *not* equivalent to `return jax.random.split(rng)`, because
