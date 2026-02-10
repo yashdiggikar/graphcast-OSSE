@@ -249,54 +249,46 @@ def chunked_prediction(
 
 
 
+from typing import Iterator, Optional, Sequence
+import logging
+import numpy as np
+import chex
+import jax
+import xarray as xr
+
+# PredictorFn should be the same type alias GraphCast uses
+# from graphcast.rollout import PredictorFn  # if you have it
+# otherwise leave it, Python doesn't need it at runtime.
+
 def chunked_prediction_generator(
-    predictor_fn: PredictorFn,
+    predictor_fn,
     rng: chex.PRNGKey,
-    inputs: xarray.Dataset,
-    targets_template: xarray.Dataset,
-    forcings: xarray.Dataset,
+    inputs: xr.Dataset,
+    targets_template: xr.Dataset,
+    forcings: xr.Dataset,
     num_steps_per_chunk: int = 1,
     verbose: bool = False,
     pmap_devices: Optional[Sequence[jax.Device]] = None,
-    # ---- NEW KWARGS FOR TEMP INSERTION ----
-    truth_ds: Optional[xarray.Dataset] = None,        # ERA5 truth (preferred: already opened, same grid/times)
-    truth_t_path: Optional[str] = None,               # Alternatively, path to ERA5 file if truth_ds not given
-    temp_var_name: str = "t",                         # Temperature variable name in truth_ds & predictions
-    inject_from_step: Optional[int] = None,           # Global step index (0-based) from which to start replacing
-) -> Iterator[xarray.Dataset]:
-  """Outputs a long trajectory by yielding chunked predictions.
 
-  Args:
-    predictor_fn: Function to use to make predictions for each chunk.
-    rng: Random key.
-    inputs: Inputs for the model.
-    targets_template: Template for the target prediction, requires targets
-        equispaced in time.
-    forcings: Optional forcing for the model.
-    num_steps_per_chunk: How many of the steps in `targets_template` to predict
-        at each call of `predictor_fn`. It must evenly divide the number of
-        steps in `targets_template`.
-    verbose: Whether to log the current chunk being predicted.
-    pmap_devices: List of devices over which predictor_fn is pmapped, or None if
-      it is not pmapped.
-    truth_ds: ERA5 truth `xarray.Dataset` on the same grid/time (contains `temp_var_name`).
-    truth_t_path: Path to ERA5 file to open (used only if `truth_ds` is None).
-    temp_var_name: Name of the temperature variable to replace (default "t").
-    inject_from_step: Global step (0-based) at which to start replacing temp.
-      If None, no replacement occurs.
+    # ---- TEMP INSERTION (LEAD-TIME MODE) ----
+    truth_ds: Optional[xr.Dataset] = None,     # MUST have time=lead_times (timedeltas), not datetimes
+    temp_var_name: str = "t",                 # variable name in truth_ds AND predictions
+    inject_from_step: Optional[int] = None,   # 0-based global step index
+) -> Iterator[xr.Dataset]:
+  """
+  Outputs a long trajectory by yielding chunked predictions.
 
-  Yields:
-    The predictions for each chunked step of the chunked rollout, such that
-    if all predictions are concatenated in time this would match the targets
-    template in structure.
-
+  Lead-time mode contract:
+  - targets_template.time is lead times (e.g. 6h, 12h, 18h ...)
+  - truth_ds.time MUST ALSO be lead times (same dtype/values as targets_template.time)
   """
 
-  # Create copies to avoid mutating inputs.
-  inputs = xarray.Dataset(inputs)
-  targets_template = xarray.Dataset(targets_template)
-  forcings = xarray.Dataset(forcings)
+  # Make copies to avoid mutating callers.
+  inputs = xr.Dataset(inputs)
+  targets_template = xr.Dataset(targets_template)
+  forcings = xr.Dataset(forcings)
 
+  # Strip datetime coord (GraphCast does this to prevent recompiles)
   if "datetime" in inputs.coords:
     del inputs.coords["datetime"]
 
@@ -309,47 +301,43 @@ def chunked_prediction_generator(
   if "datetime" in forcings.coords:
     del forcings.coords["datetime"]
 
-  num_target_steps = targets_template.dims["time"]
+  num_target_steps = targets_template.sizes["time"]
   num_chunks, remainder = divmod(num_target_steps, num_steps_per_chunk)
   if remainder != 0:
     raise ValueError(
-        f"The number of steps per chunk {num_steps_per_chunk} must "
-        f"evenly divide the number of target steps {num_target_steps} ")
+        f"num_steps_per_chunk={num_steps_per_chunk} must evenly divide "
+        f"num_target_steps={num_target_steps}"
+    )
 
+  # Targets time axis must be evenly spaced
   if len(np.unique(np.diff(targets_template.coords["time"].data))) > 1:
-    raise ValueError("The targets time coordinates must be evenly spaced")
+    raise ValueError("targets_template.time must be evenly spaced")
 
-  # Our template targets will always have a time axis corresponding for the
-  # timedeltas for the first chunk.
-  targets_chunk_time = targets_template.time.isel(
-      time=slice(0, num_steps_per_chunk))
+  # Template time used for ALL chunks (first chunk only) to avoid recompilation
+  targets_chunk_time = targets_template.time.isel(time=slice(0, num_steps_per_chunk))
 
   current_inputs = inputs
 
-  # -------------------- open/validate truth source (for insertion) --------------------
-  if truth_ds is None and truth_t_path is not None:
-    # Lazy open; assumes same grid/levels/times as targets_template
-    truth_ds = xarray.open_dataset(truth_t_path)
+  # ---- Validate truth dataset if insertion requested ----
+  if inject_from_step is not None:
+    if truth_ds is None:
+      raise ValueError("inject_from_step is set but truth_ds is None (lead-time truth is required).")
 
-  if truth_ds is not None:
+    if "time" not in truth_ds.coords:
+      raise ValueError("truth_ds must have a 'time' coordinate (lead times).")
+
+    # Check var exists in truth
     if temp_var_name not in truth_ds.data_vars:
       raise KeyError(
           f"temp_var_name='{temp_var_name}' not found in truth_ds. "
           f"Available: {list(truth_ds.data_vars)}"
       )
-    if "time" not in truth_ds.coords:
-      raise ValueError("truth_ds must have a 'time' coordinate aligned to targets_template.time")
 
-  # To compute global (0..num_target_steps-1) step index during rollout
+  # Global step counter (0..num_target_steps-1)
   global_step_offset = 0
 
-  def split_rng_fn(rng):
-    # Note, this is *not* equivalent to `return jax.random.split(rng)`, because
-    # by assigning to a tuple, the single numpy array returned by
-    # `jax.random.split` actually gets split into two arrays, so when calling
-    # the function with pmap the output is Tuple[Array, Array], where the
-    # leading axis of each array is `num devices`.
-    rng1, rng2 = jax.random.split(rng)
+  def split_rng_fn(rng_):
+    rng1, rng2 = jax.random.split(rng_)
     return rng1, rng2
 
   if pmap_devices is not None:
@@ -357,89 +345,94 @@ def chunked_prediction_generator(
 
   for chunk_index in range(num_chunks):
     if verbose:
-      logging.info("Chunk %d/%d", chunk_index, num_chunks)
-      logging.flush()
+      logging.info("Chunk %d/%d", chunk_index + 1, num_chunks)
 
-    # Select targets for the time period that we are predicting for this chunk.
     target_offset = num_steps_per_chunk * chunk_index
     target_slice = slice(target_offset, target_offset + num_steps_per_chunk)
+
     current_targets_template = targets_template.isel(time=target_slice)
 
-    # Save the actual target times (real coordinates for this chunk).
+    # These are the REAL lead-time labels for this chunk
     actual_target_time = current_targets_template.coords["time"]
 
-    # Replace the timedelta, by the one corresponding to the first chunk, so we
-    # don't recompile at every iteration, keeping the
-    current_targets_template = current_targets_template.assign_coords(
-        time=targets_chunk_time).compute()
+    # Replace time coord with first-chunk time coord to avoid recompilation
+    current_targets_template = current_targets_template.assign_coords(time=targets_chunk_time).compute()
 
     current_forcings = forcings.isel(time=target_slice)
-    current_forcings = current_forcings.assign_coords(time=targets_chunk_time)
-    current_forcings = current_forcings.compute()
+    current_forcings = current_forcings.assign_coords(time=targets_chunk_time).compute()
 
-    # Make predictions for the chunk.
     rng, this_rng = split_rng_fn(rng)
     predictions = predictor_fn(
         rng=this_rng,
         inputs=current_inputs,
         targets_template=current_targets_template,
-        forcings=current_forcings)
+        forcings=current_forcings
+    )
 
-    # In the pmapped case, pull data off devices to avoid OOM, and so we can
-    # modify predictions on host (for temp insertion).
-    if pmap_devices is not None:
-      predictions = jax.device_get(predictions)
-      current_forcings = jax.device_get(current_forcings)
-      current_inputs = jax.device_get(current_inputs)
+    # IMPORTANT FIX:
+    # Always bring predictions to host before we try to mutate (JAX arrays are immutable).
+    predictions = jax.device_get(predictions)
+    current_forcings = jax.device_get(current_forcings)
+    current_inputs = jax.device_get(current_inputs)
 
-    # -------------------- TEMP INSERTION (ERA5 truth) --------------------
-    # Replace predictions[temp_var_name] for each step in this chunk whose
-    # global step index >= inject_from_step. This is done BEFORE computing
-    # next_frame/current_inputs, so the AR state uses the corrected temperature.
-    if (
-        truth_ds is not None
-        and inject_from_step is not None
-        and temp_var_name in predictions.data_vars
-    ):
-      # actual_target_time still holds the true time coords for this chunk.
-      step_times = actual_target_time.data  # shape: (num_steps_per_chunk,)
+    # ---- TEMP INSERTION (LEAD-TIME MODE) ----
+    if inject_from_step is not None:
+      if temp_var_name not in predictions.data_vars:
+        raise KeyError(
+            f"temp_var_name='{temp_var_name}' not found in predictions. "
+            f"Available: {list(predictions.data_vars)}"
+        )
 
-      for i, ts in enumerate(step_times):
-        global_step = global_step_offset + i  # 0-based across whole rollout
+      # Lead times for THIS chunk (vector)
+      step_leads = actual_target_time.data  # shape (num_steps_per_chunk,)
+      global_steps = global_step_offset + np.arange(len(step_leads))
 
-        if global_step >= inject_from_step:
-          # ERA5 truth at this timestamp; dims typically (time, level, lat, lon)
-          # or possibly with a batch/sample dim that xarray can broadcast.
-          true_t = truth_ds[temp_var_name].sel(time=ts)
+      # Which indices in this chunk should be injected?
+      mask = global_steps >= inject_from_step
+      if np.any(mask):
+        # Select truth for only the needed lead times (vectorized)
+        leads_to_inject = step_leads[mask]
+        truth_chunk = truth_ds[temp_var_name].sel(time=leads_to_inject)
 
-          # predictions[temp_var_name] has a "time" axis for this chunk.
-          # We overwrite only this step (all levels/grid points), leaving
-          # other variables unchanged.
-          predictions[temp_var_name][dict(time=i)] = true_t
+        # Now assign into the prediction array at those time indices
+        pred_da = predictions[temp_var_name]
 
-    # -------------------- end TEMP INSERTION --------------------
+        # indices in this chunk we inject (0..num_steps_per_chunk-1)
+        inject_idx = np.nonzero(mask)[0]
 
+        # write into NumPy-backed values (safe)
+        pred_vals = pred_da.values
+        truth_vals = truth_chunk.values
+
+        # Ensure truth has time axis aligned with inject count
+        # truth_vals should have leading dimension = len(inject_idx)
+        pred_vals[inject_idx, ...] = truth_vals
+
+        # Put back (keeps same coords/dims)
+        predictions[temp_var_name].values[:] = pred_vals
+
+    # ---- Build next inputs (autoregressive state) ----
     if chunk_index == num_chunks - 1:
-      # No need to call `_get_next_inputs` on the last iteration.
       current_inputs = None
     else:
-      next_frame = xarray.merge([predictions, current_forcings])
+      next_frame = xr.merge([predictions, current_forcings])
       next_inputs = _get_next_inputs(current_inputs, next_frame)
-      # Shift timedelta coordinates, so we don't recompile at every iteration.
-      next_inputs = next_inputs.assign_coords(
-          time=current_inputs.coords["time"])
+      next_inputs = next_inputs.assign_coords(time=current_inputs.coords["time"])
       current_inputs = next_inputs
 
-    # Advance global step counter by this chunk length.
+    # Advance global step counter
     global_step_offset += num_steps_per_chunk
 
-    # At this point we can assign the actual targets time coordinates.
+    # Restore actual lead-time labels on predictions
     predictions = predictions.assign_coords(time=actual_target_time)
+
+    # Reattach datetime coord if it was present in template
     if output_datetime is not None:
-      predictions.coords["datetime"] = output_datetime.isel(
-          time=target_slice)
+      predictions.coords["datetime"] = output_datetime.isel(time=target_slice)
+
     yield predictions
     del predictions
+
 
 
   def split_rng_fn(rng):
