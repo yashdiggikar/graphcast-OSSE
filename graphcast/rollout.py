@@ -348,7 +348,7 @@ def chunked_prediction_generator(
           f"inject_from_step={inject_from_step} out of range for num_target_steps={num_target_steps}."
       )
 
-    # Strong alignment check: lead-times must match (at least for the first N steps)
+    # Strong alignment check: lead-times must match (for the horizon we use)
     tt = targets_template["time"].values
     tr = truth_ds["time"].values
     if not np.array_equal(tr[:num_target_steps], tt):
@@ -419,23 +419,32 @@ def chunked_prediction_generator(
         inject_idx = np.nonzero(mask)[0]
         leads_to_inject = step_leads[mask]
 
-        # Prefer sel by lead-times; fallback to isel by positions
+        # Select truth
         try:
           truth_chunk = truth_ds[temp_var_name].sel(time=leads_to_inject)
         except Exception:
           truth_chunk = truth_ds[temp_var_name].isel(time=global_steps[mask])
 
-        # ---- FIX: force writable copy before assignment ----
         pred_da = predictions[temp_var_name]
 
-        pred_vals = np.array(pred_da.values, copy=True)     # ✅ writable
-        truth_vals = np.array(truth_chunk.values, copy=False)
+        # 1) Ensure truth has batch dim if predictions do
+        if "batch" in pred_da.dims and "batch" not in truth_chunk.dims:
+          truth_chunk = truth_chunk.expand_dims(batch=pred_da.coords["batch"])
 
-        pred_vals[inject_idx, ...] = truth_vals
+        # 2) Align truth to prediction grid/dims for the injected timesteps
+        #    This fixes lat=180 vs lat=181, coord name differences handled by reindex_like.
+        truth_chunk = truth_chunk.reindex_like(
+            pred_da.isel(time=inject_idx),
+            method="nearest"
+        )
 
-        # Assign back as a whole new array (most robust)
-        predictions[temp_var_name].values = pred_vals
-        # -----------------------------------------------
+        # 3) Assign per time index (xarray handles dim order safely)
+        for k, ti in enumerate(inject_idx):
+          pred_da.loc[dict(time=ti)] = truth_chunk.isel(time=k)
+
+        # Put back (pred_da is a view, but we reassign explicitly for clarity)
+        predictions[temp_var_name] = pred_da
+    # -------------------- end TEMP INSERTION --------------------
 
     # ---- Build next inputs (autoregressive state) ----
     if chunk_index < num_chunks - 1:
@@ -458,7 +467,6 @@ def chunked_prediction_generator(
 
     yield predictions
     del predictions
-
 
 
 
