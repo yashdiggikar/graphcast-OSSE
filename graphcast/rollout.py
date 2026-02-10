@@ -246,13 +246,13 @@ def chunked_prediction(
     chunks_list.append(jax.device_get(prediction_chunk))
   return xarray.concat(chunks_list, dim="time")
 
+
 from typing import Iterator, Optional, Sequence
 import logging
 import numpy as np
 import chex
 import jax
 import xarray as xr
-
 
 def chunked_prediction_generator(
     predictor_fn,
@@ -351,10 +351,7 @@ def chunked_prediction_generator(
     # Strong alignment check: lead-times must match (at least for the first N steps)
     tt = targets_template["time"].values
     tr = truth_ds["time"].values
-
-    # We require exact equality for the forecast horizon we will use
     if not np.array_equal(tr[:num_target_steps], tt):
-      # Provide a helpful debug snippet
       raise ValueError(
           "truth_ds.time does not exactly match targets_template.time (lead-time mode).\n"
           f"targets_template.time[:5]={tt[:5]}\n"
@@ -414,7 +411,6 @@ def chunked_prediction_generator(
             f"Available: {list(predictions.data_vars)}"
         )
 
-      # lead times for this chunk
       step_leads = actual_target_time.data
       global_steps = global_step_offset + np.arange(len(step_leads))
 
@@ -423,23 +419,25 @@ def chunked_prediction_generator(
         inject_idx = np.nonzero(mask)[0]
         leads_to_inject = step_leads[mask]
 
-        # Robust selection: leads are timedeltas; since we already asserted exact match,
-        # we can safely index by position too.
-        # We'll use sel first (readable), and fallback to isel if any dtype issue occurs.
+        # Prefer sel by lead-times; fallback to isel by positions
         try:
           truth_chunk = truth_ds[temp_var_name].sel(time=leads_to_inject)
         except Exception:
           truth_chunk = truth_ds[temp_var_name].isel(time=global_steps[mask])
 
+        # ---- FIX: force writable copy before assignment ----
         pred_da = predictions[temp_var_name]
-        pred_vals = pred_da.values
-        truth_vals = truth_chunk.values
+
+        pred_vals = np.array(pred_da.values, copy=True)     # ✅ writable
+        truth_vals = np.array(truth_chunk.values, copy=False)
 
         pred_vals[inject_idx, ...] = truth_vals
-        predictions[temp_var_name].values[:] = pred_vals
+
+        # Assign back as a whole new array (most robust)
+        predictions[temp_var_name].values = pred_vals
+        # -----------------------------------------------
 
     # ---- Build next inputs (autoregressive state) ----
-    # IMPORTANT: we MUST NOT call _get_next_inputs when current_inputs is None.
     if chunk_index < num_chunks - 1:
       next_frame = xr.merge([predictions, current_forcings])
       next_inputs = _get_next_inputs(current_inputs, next_frame)
@@ -450,18 +448,17 @@ def chunked_prediction_generator(
     else:
       current_inputs = None
 
-    # Advance global step counter
     global_step_offset += num_steps_per_chunk
 
     # Restore actual lead-time labels on predictions
     predictions = predictions.assign_coords(time=actual_target_time)
 
-    # Reattach datetime coord if present
     if output_datetime is not None:
       predictions.coords["datetime"] = output_datetime.isel(time=target_slice)
 
     yield predictions
     del predictions
+
 
 
 
