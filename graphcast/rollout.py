@@ -246,9 +246,6 @@ def chunked_prediction(
     chunks_list.append(jax.device_get(prediction_chunk))
   return xarray.concat(chunks_list, dim="time")
 
-
-
-
 from typing import Iterator, Optional, Sequence
 import logging
 import numpy as np
@@ -256,9 +253,6 @@ import chex
 import jax
 import xarray as xr
 
-# PredictorFn should be the same type alias GraphCast uses
-# from graphcast.rollout import PredictorFn  # if you have it
-# otherwise leave it, Python doesn't need it at runtime.
 
 def chunked_prediction_generator(
     predictor_fn,
@@ -301,6 +295,17 @@ def chunked_prediction_generator(
   if "datetime" in forcings.coords:
     del forcings.coords["datetime"]
 
+  # Basic shape checks
+  if "time" not in targets_template.dims:
+    raise ValueError("targets_template must have a 'time' dimension.")
+  if "time" not in forcings.dims:
+    raise ValueError("forcings must have a 'time' dimension.")
+  if targets_template.sizes["time"] != forcings.sizes["time"]:
+    raise ValueError(
+        f"targets_template.time ({targets_template.sizes['time']}) and "
+        f"forcings.time ({forcings.sizes['time']}) must match."
+    )
+
   num_target_steps = targets_template.sizes["time"]
   num_chunks, remainder = divmod(num_target_steps, num_steps_per_chunk)
   if remainder != 0:
@@ -326,11 +331,37 @@ def chunked_prediction_generator(
     if "time" not in truth_ds.coords:
       raise ValueError("truth_ds must have a 'time' coordinate (lead times).")
 
-    # Check var exists in truth
     if temp_var_name not in truth_ds.data_vars:
       raise KeyError(
           f"temp_var_name='{temp_var_name}' not found in truth_ds. "
           f"Available: {list(truth_ds.data_vars)}"
+      )
+
+    if truth_ds.sizes.get("time", 0) < num_target_steps:
+      raise ValueError(
+          f"truth_ds has only {truth_ds.sizes.get('time', 0)} time steps but "
+          f"targets_template needs {num_target_steps}."
+      )
+
+    if inject_from_step < 0 or inject_from_step >= num_target_steps:
+      raise ValueError(
+          f"inject_from_step={inject_from_step} out of range for num_target_steps={num_target_steps}."
+      )
+
+    # Strong alignment check: lead-times must match (at least for the first N steps)
+    tt = targets_template["time"].values
+    tr = truth_ds["time"].values
+
+    # We require exact equality for the forecast horizon we will use
+    if not np.array_equal(tr[:num_target_steps], tt):
+      # Provide a helpful debug snippet
+      raise ValueError(
+          "truth_ds.time does not exactly match targets_template.time (lead-time mode).\n"
+          f"targets_template.time[:5]={tt[:5]}\n"
+          f"truth_ds.time[:5]={tr[:5]}\n"
+          f"targets_template.time[-5:]={tt[-5:]}\n"
+          f"truth_ds.time[-5:]={tr[:num_target_steps][-5:]}\n"
+          "Fix by building truth_ds with time=lead_times exactly equal to targets_template.time."
       )
 
   # Global step counter (0..num_target_steps-1)
@@ -352,7 +383,7 @@ def chunked_prediction_generator(
 
     current_targets_template = targets_template.isel(time=target_slice)
 
-    # These are the REAL lead-time labels for this chunk
+    # REAL lead-time labels for this chunk
     actual_target_time = current_targets_template.coords["time"]
 
     # Replace time coord with first-chunk time coord to avoid recompilation
@@ -361,6 +392,7 @@ def chunked_prediction_generator(
     current_forcings = forcings.isel(time=target_slice)
     current_forcings = current_forcings.assign_coords(time=targets_chunk_time).compute()
 
+    # Model call
     rng, this_rng = split_rng_fn(rng)
     predictions = predictor_fn(
         rng=this_rng,
@@ -369,8 +401,7 @@ def chunked_prediction_generator(
         forcings=current_forcings
     )
 
-    # IMPORTANT FIX:
-    # Always bring predictions to host before we try to mutate (JAX arrays are immutable).
+    # Always bring to host before mutation
     predictions = jax.device_get(predictions)
     current_forcings = jax.device_get(current_forcings)
     current_inputs = jax.device_get(current_inputs)
@@ -383,42 +414,41 @@ def chunked_prediction_generator(
             f"Available: {list(predictions.data_vars)}"
         )
 
-      # Lead times for THIS chunk (vector)
-      step_leads = actual_target_time.data  # shape (num_steps_per_chunk,)
+      # lead times for this chunk
+      step_leads = actual_target_time.data
       global_steps = global_step_offset + np.arange(len(step_leads))
 
-      # Which indices in this chunk should be injected?
       mask = global_steps >= inject_from_step
       if np.any(mask):
-        # Select truth for only the needed lead times (vectorized)
-        leads_to_inject = step_leads[mask]
-        truth_chunk = truth_ds[temp_var_name].sel(time=leads_to_inject)
-
-        # Now assign into the prediction array at those time indices
-        pred_da = predictions[temp_var_name]
-
-        # indices in this chunk we inject (0..num_steps_per_chunk-1)
         inject_idx = np.nonzero(mask)[0]
+        leads_to_inject = step_leads[mask]
 
-        # write into NumPy-backed values (safe)
+        # Robust selection: leads are timedeltas; since we already asserted exact match,
+        # we can safely index by position too.
+        # We'll use sel first (readable), and fallback to isel if any dtype issue occurs.
+        try:
+          truth_chunk = truth_ds[temp_var_name].sel(time=leads_to_inject)
+        except Exception:
+          truth_chunk = truth_ds[temp_var_name].isel(time=global_steps[mask])
+
+        pred_da = predictions[temp_var_name]
         pred_vals = pred_da.values
         truth_vals = truth_chunk.values
 
-        # Ensure truth has time axis aligned with inject count
-        # truth_vals should have leading dimension = len(inject_idx)
         pred_vals[inject_idx, ...] = truth_vals
-
-        # Put back (keeps same coords/dims)
         predictions[temp_var_name].values[:] = pred_vals
 
     # ---- Build next inputs (autoregressive state) ----
-    if chunk_index == num_chunks - 1:
-      current_inputs = None
-    else:
+    # IMPORTANT: we MUST NOT call _get_next_inputs when current_inputs is None.
+    if chunk_index < num_chunks - 1:
       next_frame = xr.merge([predictions, current_forcings])
       next_inputs = _get_next_inputs(current_inputs, next_frame)
+
+      # shift time coords back for compilation stability
       next_inputs = next_inputs.assign_coords(time=current_inputs.coords["time"])
       current_inputs = next_inputs
+    else:
+      current_inputs = None
 
     # Advance global step counter
     global_step_offset += num_steps_per_chunk
@@ -426,83 +456,13 @@ def chunked_prediction_generator(
     # Restore actual lead-time labels on predictions
     predictions = predictions.assign_coords(time=actual_target_time)
 
-    # Reattach datetime coord if it was present in template
+    # Reattach datetime coord if present
     if output_datetime is not None:
       predictions.coords["datetime"] = output_datetime.isel(time=target_slice)
 
     yield predictions
     del predictions
 
-
-
-  def split_rng_fn(rng):
-    # Note, this is *not* equivalent to `return jax.random.split(rng)`, because
-    # by assigning to a tuple, the single numpy array returned by
-    # `jax.random.split` actually gets split into two arrays, so when calling
-    # the function with pmap the output is Tuple[Array, Array], where the
-    # leading axis of each array is `num devices`.
-    rng1, rng2 = jax.random.split(rng)
-    return rng1, rng2
-
-  if pmap_devices is not None:
-    split_rng_fn = jax.pmap(split_rng_fn, devices=pmap_devices)
-
-  for chunk_index in range(num_chunks):
-    if verbose:
-      logging.info("Chunk %d/%d", chunk_index, num_chunks)
-      logging.flush()
-
-    # Select targets for the time period that we are predicting for this chunk.
-    target_offset = num_steps_per_chunk * chunk_index
-    target_slice = slice(target_offset, target_offset + num_steps_per_chunk)
-    current_targets_template = targets_template.isel(time=target_slice)
-
-    # Replace the timedelta, by the one corresponding to the first chunk, so we
-    # don't recompile at every iteration, keeping the
-    actual_target_time = current_targets_template.coords["time"]
-    current_targets_template = current_targets_template.assign_coords(
-        time=targets_chunk_time).compute()
-
-    current_forcings = forcings.isel(time=target_slice)
-    current_forcings = current_forcings.assign_coords(time=targets_chunk_time)
-    current_forcings = current_forcings.compute()
-    # Make predictions for the chunk.
-    rng, this_rng = split_rng_fn(rng)
-    predictions = predictor_fn(
-        rng=this_rng,
-        inputs=current_inputs,
-        targets_template=current_targets_template,
-        forcings=current_forcings)
-
-    # In the pmapped case, profiling reveals that the predictions, forcings and
-    # inputs are all copied onto a single TPU, causing OOM. To avoid this
-    # we pull all of the input/output data off the devices. This will have
-    # some performance impact, but maximise the memory efficiency.
-    # TODO(aelkadi): Pmap `_get_next_inputs` when running under pmap, and
-    # remove the device_get.
-    if pmap_devices is not None:
-      predictions = jax.device_get(predictions)
-      current_forcings = jax.device_get(current_forcings)
-      current_inputs = jax.device_get(current_inputs)
-
-    if chunk_index == num_chunks - 1:
-      # No need to call `_get_next_inputs` on the last iteration.
-      current_inputs = None
-    else:
-      next_frame = xarray.merge([predictions, current_forcings])
-      next_inputs = _get_next_inputs(current_inputs, next_frame)
-      # Shift timedelta coordinates, so we don't recompile at every iteration.
-      next_inputs = next_inputs.assign_coords(
-          time=current_inputs.coords["time"])
-      current_inputs = next_inputs
-
-    # At this point we can assign the actual targets time coordinates.
-    predictions = predictions.assign_coords(time=actual_target_time)
-    if output_datetime is not None:
-      predictions.coords["datetime"] = output_datetime.isel(
-          time=target_slice)
-    yield predictions
-    del predictions
 
 
 def _get_next_inputs(
