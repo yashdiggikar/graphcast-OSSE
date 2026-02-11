@@ -432,17 +432,15 @@ def chunked_prediction_generator(
           truth_chunk = truth_chunk.expand_dims(batch=pred_da.coords["batch"])
 
         # 2) Align truth to prediction grid/dims for the injected timesteps
-        #    This fixes lat=180 vs lat=181, coord name differences handled by reindex_like.
         truth_chunk = truth_chunk.reindex_like(
             pred_da.isel(time=inject_idx),
             method="nearest"
         )
 
-        # 3) Assign per time index (xarray handles dim order safely)
+        # 3) Assign per time index (FIX: integer indexing, not label indexing)
         for k, ti in enumerate(inject_idx):
-          pred_da.loc[dict(time=ti)] = truth_chunk.isel(time=k)
+          pred_da[dict(time=ti)] = truth_chunk.isel(time=k)
 
-        # Put back (pred_da is a view, but we reassign explicitly for clarity)
         predictions[temp_var_name] = pred_da
     # -------------------- end TEMP INSERTION --------------------
 
