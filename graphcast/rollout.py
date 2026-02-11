@@ -265,10 +265,9 @@ def chunked_prediction_generator(
     verbose: bool = False,
     pmap_devices: Optional[Sequence[jax.Device]] = None,
 
-    # ---- U/V WIND INSERTION (LEAD-TIME MODE) ----
+    # ---- GEOPOTENTIAL INSERTION (LEAD-TIME MODE) ----
     truth_ds: Optional[xr.Dataset] = None,          # MUST have time=lead_times (timedeltas)
-    u_var_name: str = "u_component_of_wind",        # variable name in truth_ds AND predictions (pressure-level U)
-    v_var_name: str = "v_component_of_wind",        # variable name in truth_ds AND predictions (pressure-level V)
+    z_var_name: str = "geopotential",               # variable name in truth_ds AND predictions (pressure-level Z)
     inject_from_step: Optional[int] = None,         # 0-based global step index
 ) -> Iterator[xr.Dataset]:
   """
@@ -279,8 +278,7 @@ def chunked_prediction_generator(
   - truth_ds.time MUST ALSO be lead times (same dtype/values as targets_template.time)
 
   This version performs HARD truth insertion for:
-    - u_var_name (U wind) at ALL pressure levels
-    - v_var_name (V wind) at ALL pressure levels
+    - z_var_name (geopotential) at ALL pressure levels
   starting from inject_from_step, and the inserted values are used for subsequent AR steps.
   """
 
@@ -338,11 +336,9 @@ def chunked_prediction_generator(
     if "time" not in truth_ds.coords:
       raise ValueError("truth_ds must have a 'time' coordinate (lead times).")
 
-    # Must contain both U and V
-    missing = [vn for vn in (u_var_name, v_var_name) if vn not in truth_ds.data_vars]
-    if missing:
+    if z_var_name not in truth_ds.data_vars:
       raise KeyError(
-          f"Missing wind variables in truth_ds: {missing}. "
+          f"Missing geopotential variable in truth_ds: '{z_var_name}'. "
           f"Available: {list(truth_ds.data_vars)}"
       )
 
@@ -412,13 +408,11 @@ def chunked_prediction_generator(
     current_forcings = jax.device_get(current_forcings)
     current_inputs = jax.device_get(current_inputs)
 
-    # ---- U/V WIND INSERTION (LEAD-TIME MODE) ----
+    # ---- GEOPOTENTIAL INSERTION (LEAD-TIME MODE) ----
     if inject_from_step is not None:
-      # Ensure both exist in predictions
-      missing_pred = [vn for vn in (u_var_name, v_var_name) if vn not in predictions.data_vars]
-      if missing_pred:
+      if z_var_name not in predictions.data_vars:
         raise KeyError(
-            f"Missing wind variables in predictions: {missing_pred}. "
+            f"Missing geopotential variable in predictions: '{z_var_name}'. "
             f"Available: {list(predictions.data_vars)}"
         )
 
@@ -430,35 +424,30 @@ def chunked_prediction_generator(
         inject_idx = np.nonzero(mask)[0]
         leads_to_inject = step_leads[mask]
 
-        # helper: inject one variable
-        def _inject_one(var_name: str):
-          pred_da = predictions[var_name]
+        pred_da = predictions[z_var_name]
 
-          # Select truth for this chunk
-          try:
-            truth_chunk = truth_ds[var_name].sel(time=leads_to_inject)
-          except Exception:
-            truth_chunk = truth_ds[var_name].isel(time=global_steps[mask])
+        # Select truth for this chunk
+        try:
+          truth_chunk = truth_ds[z_var_name].sel(time=leads_to_inject)
+        except Exception:
+          truth_chunk = truth_ds[z_var_name].isel(time=global_steps[mask])
 
-          # 1) Ensure truth has batch dim if predictions do
-          if "batch" in pred_da.dims and "batch" not in truth_chunk.dims:
-            truth_chunk = truth_chunk.expand_dims(batch=pred_da.coords["batch"])
+        # 1) Ensure truth has batch dim if predictions do
+        if "batch" in pred_da.dims and "batch" not in truth_chunk.dims:
+          truth_chunk = truth_chunk.expand_dims(batch=pred_da.coords["batch"])
 
-          # 2) Align truth to prediction grid/dims for the injected timesteps
-          truth_chunk = truth_chunk.reindex_like(
-              pred_da.isel(time=inject_idx),
-              method="nearest"
-          )
+        # 2) Align truth to prediction grid/dims for the injected timesteps
+        truth_chunk = truth_chunk.reindex_like(
+            pred_da.isel(time=inject_idx),
+            method="nearest"
+        )
 
-          # 3) Assign per time index (integer indexing)
-          for k, ti in enumerate(inject_idx):
-            pred_da[dict(time=ti)] = truth_chunk.isel(time=k)
+        # 3) Assign per time index (integer indexing)
+        for k, ti in enumerate(inject_idx):
+          pred_da[dict(time=ti)] = truth_chunk.isel(time=k)
 
-          predictions[var_name] = pred_da
-
-        _inject_one(u_var_name)
-        _inject_one(v_var_name)
-    # -------------------- end U/V INSERTION --------------------
+        predictions[z_var_name] = pred_da
+    # -------------------- end Z INSERTION --------------------
 
     # ---- Build next inputs (autoregressive state) ----
     if chunk_index < num_chunks - 1:
@@ -481,6 +470,7 @@ def chunked_prediction_generator(
 
     yield predictions
     del predictions
+
 
 
 
